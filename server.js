@@ -27,19 +27,30 @@ if (!GRAPH_SERVICE_TOKEN) {
   process.exit(1);
 }
 
-// --- Simple auth middleware ---
+/* ----------------------------------
+   Auth middleware
+---------------------------------- */
 function requireToken(req, res, next) {
   const token = req.header("x-graph-token");
   if (!token || token !== GRAPH_SERVICE_TOKEN) {
-    return res.status(401).json({ status: "ERROR", message: "Unauthorized" });
+    return res.status(401).json({
+      status: "ERROR",
+      message: "Unauthorized",
+    });
   }
   next();
 }
 
+/* ----------------------------------
+   Health check
+---------------------------------- */
 app.get("/health", (_req, res) => {
   res.json({ status: "OK" });
 });
 
+/* ----------------------------------
+   BUILD GRAPH (write / reset)
+---------------------------------- */
 app.post("/build-graph", requireToken, async (req, res) => {
   const { applications, usersById } = req.body || {};
 
@@ -58,7 +69,7 @@ app.post("/build-graph", requireToken, async (req, res) => {
   const session = driver.session();
 
   try {
-    // Reset grafo (derivato)
+    // Reset grafo derivato
     await session.run("MATCH (n) DETACH DELETE n");
 
     // Build nodi + relazioni
@@ -107,6 +118,55 @@ app.post("/build-graph", requireToken, async (req, res) => {
   }
 });
 
+/* ----------------------------------
+   READ GRAPH (summary)
+---------------------------------- */
+app.get("/graph/summary", requireToken, async (_req, res) => {
+  const driver = neo4j.driver(
+    NEO4J_URI,
+    neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
+  );
+
+  const session = driver.session();
+
+  try {
+    const result = await session.run(`
+      MATCH (a:Person)-[r:CANDIDATO_A]->(b:Person)
+      RETURN 
+        a.id AS from_id,
+        a.full_name AS from_name,
+        b.id AS to_id,
+        b.full_name AS to_name,
+        r.priority AS priority
+      ORDER BY r.priority ASC
+    `);
+
+    const rows = result.records.map(r => ({
+      from_id: r.get("from_id"),
+      from_name: r.get("from_name"),
+      to_id: r.get("to_id"),
+      to_name: r.get("to_name"),
+      priority: r.get("priority"),
+    }));
+
+    res.json({
+      status: "OK",
+      relationships: rows,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "ERROR",
+      message: err?.message ?? String(err),
+    });
+  } finally {
+    await session.close();
+    await driver.close();
+  }
+});
+
+/* ----------------------------------
+   START SERVER (always last)
+---------------------------------- */
 app.listen(Number(PORT), () => {
-  console.log(`🚀 Graph service listening on http://localhost:${PORT}`);
+  console.log(`🚀 Graph service listening on port ${PORT}`);
 });
