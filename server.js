@@ -28,7 +28,7 @@ if (!GRAPH_SERVICE_TOKEN) {
 }
 
 /* ----------------------------------
-   Neo4j Driver (singleton)
+   Neo4j Driver
 ---------------------------------- */
 const driver = neo4j.driver(
   NEO4J_URI,
@@ -41,10 +41,7 @@ const driver = neo4j.driver(
 function requireToken(req, res, next) {
   const token = req.header("x-graph-token");
   if (!token || token !== GRAPH_SERVICE_TOKEN) {
-    return res.status(401).json({
-      status: "ERROR",
-      message: "Unauthorized",
-    });
+    return res.status(401).json({ status: "ERROR", message: "Unauthorized" });
   }
   next();
 }
@@ -57,35 +54,23 @@ app.get("/health", (_req, res) => {
 });
 
 /* ----------------------------------
-   BUILD GRAPH (write / reset)
+   BUILD GRAPH
 ---------------------------------- */
 app.post("/build-graph", requireToken, async (req, res) => {
   const { applications, usersById } = req.body || {};
-
-  if (!Array.isArray(applications)) {
-    return res.status(400).json({
-      status: "ERROR",
-      message: "`applications` must be an array",
-    });
-  }
-
   const session = driver.session();
 
   try {
-    // Reset grafo derivato
     await session.run("MATCH (n) DETACH DELETE n");
 
-    // Build nodi + relazioni
     await session.run(
       `
       UNWIND $apps AS app
       MERGE (a:Person {id: app.user_id})
-      ON CREATE SET a.full_name = coalesce($usersById[app.user_id], null)
-      ON MATCH  SET a.full_name = coalesce($usersById[app.user_id], a.full_name)
+      SET a.full_name = coalesce($usersById[app.user_id], a.full_name)
 
       MERGE (b:Person {id: app.target_user_id})
-      ON CREATE SET b.full_name = coalesce($usersById[app.target_user_id], null)
-      ON MATCH  SET b.full_name = coalesce($usersById[app.target_user_id], b.full_name)
+      SET b.full_name = coalesce($usersById[app.target_user_id], b.full_name)
 
       MERGE (a)-[r:CANDIDATO_A]->(b)
       SET r.priority = app.priority
@@ -93,139 +78,94 @@ app.post("/build-graph", requireToken, async (req, res) => {
       { apps: applications, usersById: usersById || {} }
     );
 
-    const nodesRes = await session.run(
+    const nodes = await session.run(
       "MATCH (n:Person) RETURN count(n) AS c"
     );
-    const relsRes = await session.run(
+    const rels = await session.run(
       "MATCH (:Person)-[r:CANDIDATO_A]->(:Person) RETURN count(r) AS c"
     );
 
-    const nodes = nodesRes.records[0].get("c").toNumber();
-    const relationships = relsRes.records[0].get("c").toNumber();
-
     res.json({
       status: "OK",
-      applications_processed: applications.length,
-      nodes,
-      relationships,
+      nodes: nodes.records[0].get("c").toNumber(),
+      relationships: rels.records[0].get("c").toNumber(),
     });
   } catch (err) {
-    console.error("Error in /build-graph:", err);
-    res.status(500).json({
-      status: "ERROR",
-      message: err?.message ?? String(err),
-    });
+    res.status(500).json({ status: "ERROR", message: err.message });
   } finally {
     await session.close();
   }
 });
 
 /* ----------------------------------
-   READ GRAPH (summary)
+   FIND CHAINS (POST — DEFINITIVO)
 ---------------------------------- */
-app.get("/graph/summary", requireToken, async (_req, res) => {
+app.post("/graph/chains", requireToken, async (_req, res) => {
   const session = driver.session();
 
   try {
-    const result = await session.run(`
-      MATCH (a:Person)-[r:CANDIDATO_A]->(b:Person)
-      RETURN 
-        a.id AS from_id,
-        a.full_name AS from_name,
-        b.id AS to_id,
-        b.full_name AS to_name,
-        r.priority AS priority
-      ORDER BY r.priority ASC
-    `);
-
-    const rows = result.records.map((r) => ({
-      from_id: r.get("from_id"),
-      from_name: r.get("from_name"),
-      to_id: r.get("to_id"),
-      to_name: r.get("to_name"),
-      priority: r.get("priority"),
-    }));
-
-    res.json({
-      status: "OK",
-      relationships: rows,
-    });
-  } catch (err) {
-    console.error("Error in /graph/summary:", err);
-    res.status(500).json({
-      status: "ERROR",
-      message: err?.message ?? String(err),
-    });
-  } finally {
-    await session.close();
-  }
-});
-
-/* ----------------------------------
-   FIND CHAINS (interlocking cycles)
----------------------------------- */
-app.get("/graph/chains", requireToken, async (_req, res) => {
-  const session = driver.session();
-
-  try {
-    // MVP: cicli diretti semplici (>=2). Limite max 10 per evitare esplosioni.
     const cypher = `
-      MATCH path = (p:Person)-[:CANDIDATO_A*2..10]->(p)
-      WHERE all(n IN nodes(path) WHERE single(m IN nodes(path) WHERE m = n))
+      MATCH path = (p:Person)-[rels:CANDIDATO_A*2..10]->(p)
+      WITH path, nodes(path) AS ns, rels
+      WHERE size(ns[0..-1]) = size(apoc.coll.toSet(ns[0..-1]))
+      WITH
+        ns[0..-1] AS persons,
+        rels,
+        CASE
+          WHEN ANY(r IN rels WHERE r.priority IS NULL)
+          THEN null
+          ELSE round(
+            reduce(total = 0.0, r IN rels | total + toFloat(r.priority))
+            / size(rels)
+            * 100
+          ) / 100
+        END AS avgPriority
       RETURN
-        [n IN nodes(path) | { id: n.id, name: n.full_name }] AS persons,
-        length(path) AS length
-      ORDER BY length ASC
-    `;
+        [p IN persons | coalesce(p.full_name, p.id)] AS people,
+        size(persons) AS length,
+        avgPriority
+`;
 
     const result = await session.run(cypher);
 
-    const chains = result.records.map((r) => {
-      const persons = r.get("persons");
-      const length = r.get("length").toNumber();
+    const seen = new Set();
 
-      // helper per UI: stringa "A → B → C → A"
-      const names = persons.map((p) => p.name ?? p.id);
-      const cycle = names.length > 0 ? `${names.join(" → ")} → ${names[0]}` : "";
+    const chains = result.records
+      .map((rec) => {
+        const people = rec.get("people");
+        const key = people.slice().sort().join("|");
 
-      return { length, persons, cycle };
-    });
+        return {
+          key,
+          people,
+          length: rec.get("length").toNumber(),
+          avgPriority: rec.get("avgPriority"),
+        };
+      })
+      .filter((c) => {
+        if (seen.has(c.key)) return false;
+        seen.add(c.key);
+        return true;
+      })
+      .map(({ key, ...rest }) => rest);
 
-    res.json({
-      status: "OK",
-      chains,
-    });
+    res.json({ status: "OK", chains });
   } catch (err) {
     console.error("Error in /graph/chains:", err);
     res.status(500).json({
       status: "ERROR",
-      message: err?.message ?? String(err),
+      message: err.message,
     });
   } finally {
     await session.close();
   }
 });
 
+
+
 /* ----------------------------------
-   START SERVER (always last)
+   START SERVER
 ---------------------------------- */
 app.listen(Number(PORT), () => {
   console.log(`🚀 Graph service listening on port ${PORT}`);
 });
-
-/* ----------------------------------
-   Graceful shutdown
----------------------------------- */
-async function shutdown(signal) {
-  try {
-    console.log(`🛑 Received ${signal}, closing Neo4j driver...`);
-    await driver.close();
-    process.exit(0);
-  } catch (e) {
-    console.error("Shutdown error:", e);
-    process.exit(1);
-  }
-}
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
