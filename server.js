@@ -8,6 +8,8 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+console.log("🚀 GRAPH SERVICE BOOT — VERSION 2026-01-02 WARMUP");
+
 
 const {
   PORT = 8787,
@@ -35,6 +37,21 @@ const driver = neo4j.driver(
   neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
 );
 
+async function ensureNeo4jReady(retries = 20) {
+  try {
+    await driver.verifyConnectivity();
+    return;
+  } catch {
+    if (retries <= 0) throw new Error("Neo4j not ready");
+
+    console.warn("⏳ Neo4j sleeping… retrying");
+    await new Promise(r => setTimeout(r, 2000));
+    return ensureNeo4jReady(retries - 1);
+  }
+}
+
+
+
 /* ----------------------------------
    Auth middleware
 ---------------------------------- */
@@ -49,58 +66,93 @@ function requireToken(req, res, next) {
 /* ----------------------------------
    Health check
 ---------------------------------- */
-app.get("/health", (_req, res) => {
-  res.json({ status: "OK" });
+app.get("/health", async (_req, res) => {
+  try {
+    await ensureNeo4jReady(0);
+    res.json({ status: "OK", neo4j: "ready" });
+  } catch {
+    res.status(503).json({ status: "ERROR", neo4j: "sleeping" });
+  }
 });
 
+
 /* ----------------------------------
-   BUILD GRAPH
+   Neo4j warmup
+---------------------------------- */
+app.post("/neo4j/warmup", requireToken, async (_req, res) => {
+  try {
+    await ensureNeo4jReady(20); // ⏱️ fino a ~30s
+    res.json({ status: "OK", neo4j: "ready" });
+  } catch (err) {
+    res.status(503).json({
+      status: "ERROR",
+      message: "Neo4j still sleeping",
+    });
+  }
+});
+console.log("📌 Registering /neo4j/warmup route");
+
+
+/* ----------------------------------
+   BUILD GRAPH (RESET + REBUILD) — compat
 ---------------------------------- */
 app.post("/build-graph", requireToken, async (req, res) => {
+  await ensureNeo4jReady();
   const { applications, usersById } = req.body || {};
   const session = driver.session();
 
   try {
-    await session.run("MATCH (n) DETACH DELETE n");
+    const out = await session.writeTransaction(async (tx) => {
+      await tx.run("MATCH (n) DETACH DELETE n");
 
-    await session.run(
-      `
-      UNWIND $apps AS app
-      MERGE (a:Person {id: app.user_id})
-      SET a.full_name = coalesce($usersById[app.user_id], a.full_name)
+      await tx.run(
+        `
+        UNWIND $apps AS app
+        MERGE (a:Person {id: app.user_id})
+        SET a.full_name = coalesce($usersById[app.user_id], a.full_name)
 
-      MERGE (b:Person {id: app.target_user_id})
-      SET b.full_name = coalesce($usersById[app.target_user_id], b.full_name)
+        MERGE (b:Person {id: app.target_user_id})
+        SET b.full_name = coalesce($usersById[app.target_user_id], b.full_name)
 
-      MERGE (a)-[r:CANDIDATO_A]->(b)
-      SET r.priority = app.priority
-      `,
-      { apps: applications, usersById: usersById || {} }
-    );
+        MERGE (a)-[r:CANDIDATO_A]->(b)
+        SET r.priority = app.priority
+        `,
+        { apps: applications || [], usersById: usersById || {} }
+      );
 
-    const nodes = await session.run(
-      "MATCH (n:Person) RETURN count(n) AS c"
-    );
-    const rels = await session.run(
-      "MATCH (:Person)-[r:CANDIDATO_A]->(:Person) RETURN count(r) AS c"
-    );
+      const nodes = await tx.run("MATCH (n:Person) RETURN count(n) AS c");
+      const rels = await tx.run(
+        "MATCH (:Person)-[r:CANDIDATO_A]->(:Person) RETURN count(r) AS c"
+      );
 
-    res.json({
-      status: "OK",
-      nodes: nodes.records[0].get("c").toNumber(),
-      relationships: rels.records[0].get("c").toNumber(),
+      return {
+        nodes: nodes.records[0].get("c").toNumber(),
+        relationships: rels.records[0].get("c").toNumber(),
+      };
     });
+
+    res.json({ status: "OK", ...out });
   } catch (err) {
-    res.status(500).json({ status: "ERROR", message: err.message });
+    console.error("Error in /build-graph:", err);
+
+    const msg =
+      err?.message?.includes("ServiceUnavailable")
+        ? "Neo4j in avvio. Riprova tra qualche secondo."
+        : err.message;
+
+    res.status(500).json({ status: "ERROR", message: msg });
   } finally {
     await session.close();
   }
 });
 
+
+
 /* ----------------------------------
    FIND CHAINS (POST — DEFINITIVO)
 ---------------------------------- */
 app.post("/graph/chains", requireToken, async (_req, res) => {
+  await ensureNeo4jReady();
   const session = driver.session();
 
   try {
