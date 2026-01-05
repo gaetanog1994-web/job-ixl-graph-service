@@ -172,6 +172,52 @@ app.get("/api/_debug/supabase", (_req, res) => {
   });
 });
 
+/* ----------------------------------
+   DEBUG: Auth check (TEMPORARY)
+   - Does NOT print the token
+   - Returns Supabase getUser() error details
+---------------------------------- */
+app.post("/api/_debug/auth-check", async (req, res) => {
+  try {
+    const authHeader = req.header("authorization") || "";
+    const m = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!m) {
+      return res.status(400).json({
+        ok: false,
+        reason: "missing_bearer",
+        hasAuthHeader: !!authHeader,
+      });
+    }
+
+    const jwt = m[1];
+
+    // Basic metadata (safe)
+    const parts = jwt.split(".");
+    const tokenShapeOk = parts.length === 3;
+
+    // Call Supabase to validate token
+    const { data, error } = await supabaseAdmin.auth.getUser(jwt);
+
+    return res.json({
+      ok: !error && !!data?.user,
+      tokenShapeOk,
+      user: data?.user ? { id: data.user.id, email: data.user.email } : null,
+      error: error
+        ? {
+          message: error.message,
+          status: error.status,
+          name: error.name,
+        }
+        : null,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      reason: e?.message || "unknown_error",
+    });
+  }
+});
+
 
 function requireSelfOrAdmin(paramName = "userId") {
   return async (req, res, next) => {
