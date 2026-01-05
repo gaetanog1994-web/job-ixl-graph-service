@@ -465,6 +465,31 @@ app.post("/graph/summary", requireAdmin, async (_req, res) => {
   }
 });
 
+app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) => {
+  const scenarioId = req.params.id;
+
+  // Risposta immediata: evita timeouts e rende l’API "prodotto-like"
+  res.status(202).json({ status: "accepted", scenarioId });
+
+  // Lavoro asincrono "fire-and-forget" (stessa istanza)
+  setImmediate(async () => {
+    try {
+      console.log("[initialize] start", { scenarioId });
+
+      // TODO: qui la tua logica reale:
+      // - reset users/applications per scenario
+      // - insert fixtures
+      // - build graph se necessario
+      // Ricorda: sempre try/catch e log per step
+
+      console.log("[initialize] done", { scenarioId });
+    } catch (e) {
+      console.error("[initialize] failed", { scenarioId, err: e?.message, stack: e?.stack });
+    }
+  });
+});
+
+
 /* ----------------------------------
    Graph Summary (COUNTS) (Admin only)
 ---------------------------------- */
@@ -490,6 +515,20 @@ app.get("/graph/summary", requireAdmin, async (_req, res) => {
     await session.close(); // ✅ fondamentale
   }
 });
+
+app.get("/api/_debug/routes", (_req, res) => {
+  const routes = [];
+  app._router.stack.forEach((layer) => {
+    if (layer.route && layer.route.path) {
+      const methods = Object.keys(layer.route.methods)
+        .filter((m) => layer.route.methods[m])
+        .map((m) => m.toUpperCase());
+      routes.push({ path: layer.route.path, methods });
+    }
+  });
+  res.json({ status: "OK", routes });
+});
+
 
 /* ----------------------------------
    START SERVER
