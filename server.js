@@ -534,11 +534,85 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
     try {
       console.log("[initialize] start", { scenarioId });
 
-      // TODO: qui la tua logica reale:
-      // - reset users/applications per scenario
-      // - insert fixtures
-      // - build graph se necessario
-      // Ricorda: sempre try/catch e log per step
+      // 1) Carica le candidature scenario (isolated)
+      const { data: scenApps, error: scenErr } = await supabaseAdmin
+        .from("test_scenario_applications")
+        .select("user_id, position_id, priority")
+        .eq("scenario_id", scenarioId);
+
+      if (scenErr) throw new Error(`test_scenario_applications: ${scenErr.message}`);
+      if (!scenApps || scenApps.length === 0) {
+        console.log("[initialize] no scenario applications found", { scenarioId });
+        return;
+      }
+
+      const positionIds = [...new Set(scenApps.map((a) => a.position_id).filter(Boolean))];
+
+      // 2) Carica positions -> occupied_by (target_user_id)
+      const { data: posRows, error: posErr } = await supabaseAdmin
+        .from("positions")
+        .select("id, occupied_by")
+        .in("id", positionIds);
+
+      if (posErr) throw new Error(`positions: ${posErr.message}`);
+
+      const posToTarget = new Map((posRows ?? []).map((p) => [p.id, p.occupied_by]));
+
+      // 3) Reset: tutti inactive + delete applications
+      const { error: upErr } = await supabaseAdmin
+        .from("users")
+        .update({ availability_status: "inactive" })
+        .neq("availability_status", "inactive");
+      if (upErr) throw new Error(`users inactive: ${upErr.message}`);
+
+      const { error: delErr } = await supabaseAdmin
+        .from("applications")
+        .delete()
+        .neq("id", "00000000-0000-0000-0000-000000000000");
+      if (delErr) throw new Error(`delete applications: ${delErr.message}`);
+
+      // 4) Crea applications reali
+      const appRows = scenApps
+        .map((a) => {
+          const target_user_id = posToTarget.get(a.position_id);
+          if (!target_user_id) return null;
+          return {
+            user_id: a.user_id,
+            target_user_id,
+            priority: a.priority,
+          };
+        })
+        .filter(Boolean);
+
+      if (appRows.length === 0) {
+        console.log("[initialize] no valid application rows (missing occupied_by?)", { scenarioId });
+        return;
+      }
+
+      const { error: insErr } = await supabaseAdmin.from("applications").insert(appRows);
+      if (insErr) throw new Error(`insert applications: ${insErr.message}`);
+
+      // 5) Attiva utenti coinvolti (candidati + target) così appaiono in dashboard/mappa
+      const activeUserIds = [
+        ...new Set([
+          ...appRows.map((r) => r.user_id),
+          ...appRows.map((r) => r.target_user_id),
+        ]),
+      ];
+
+      const { error: actErr } = await supabaseAdmin
+        .from("users")
+        .update({ availability_status: "active" })
+        .in("id", activeUserIds);
+
+      if (actErr) throw new Error(`set active users: ${actErr.message}`);
+
+      console.log("[initialize] applied scenario", {
+        scenarioId,
+        applicationsInserted: appRows.length,
+        activeUsers: activeUserIds.length,
+      });
+
 
       console.log("[initialize] done", { scenarioId });
     } catch (e) {
