@@ -623,6 +623,66 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
 
 
 /* ----------------------------------
+   DEBUG: Inspect scenario data pipeline
+   (TEMPORARY – remove after check)
+---------------------------------- */
+app.get("/api/_debug/scenario/:id/inspect", requireAdmin, async (req, res) => {
+  const scenarioId = req.params.id;
+
+  // 1) scenario apps
+  const { data: scenApps, error: scenErr } = await supabaseAdmin
+    .from("test_scenario_applications")
+    .select("id, scenario_id, user_id, position_id, priority")
+    .eq("scenario_id", scenarioId);
+
+  if (scenErr) return res.status(500).json({ status: "ERROR", where: "test_scenario_applications", message: scenErr.message });
+
+  const positionIds = [...new Set((scenApps ?? []).map(a => a.position_id).filter(Boolean))];
+
+  // 2) positions lookup
+  const { data: posRows, error: posErr } = await supabaseAdmin
+    .from("positions")
+    .select("id, occupied_by")
+    .in("id", positionIds);
+
+  if (posErr) return res.status(500).json({ status: "ERROR", where: "positions", message: posErr.message });
+
+  const foundPosIds = new Set((posRows ?? []).map(p => p.id));
+  const missingPositions = positionIds.filter(id => !foundPosIds.has(id));
+  const positionsWithoutOccupant = (posRows ?? []).filter(p => !p.occupied_by).map(p => p.id);
+
+  // 3) derived appRows count (what would be inserted)
+  const posToTarget = new Map((posRows ?? []).map(p => [p.id, p.occupied_by]));
+  const derived = (scenApps ?? []).map(a => ({
+    user_id: a.user_id,
+    position_id: a.position_id,
+    target_user_id: posToTarget.get(a.position_id) || null,
+    priority: a.priority,
+  }));
+  const insertable = derived.filter(r => r.target_user_id);
+
+  return res.json({
+    status: "OK",
+    scenarioId,
+    scenAppsCount: scenApps?.length ?? 0,
+    positionIdsCount: positionIds.length,
+    positionsFoundCount: posRows?.length ?? 0,
+    missingPositionsCount: missingPositions.length,
+    missingPositions,
+    positionsWithoutOccupantCount: positionsWithoutOccupant.length,
+    positionsWithoutOccupant,
+    derivedCount: derived.length,
+    insertableCount: insertable.length,
+    sample: {
+      scenApp: scenApps?.[0] ?? null,
+      position: posRows?.[0] ?? null,
+      derived: derived?.[0] ?? null,
+    },
+  });
+});
+
+
+/* ----------------------------------
    Graph Summary (COUNTS) (Admin only)
 ---------------------------------- */
 app.get("/graph/summary", requireAdmin, async (_req, res) => {
