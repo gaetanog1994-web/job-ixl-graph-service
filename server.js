@@ -314,7 +314,7 @@ app.post(
       const { error: delErr } = await supabaseAdmin
         .from("applications")
         .delete()
-        .or(`user_id.eq.${userId},target_user_id.eq.${userId}`);
+        .or(`user_id.eq.${userId}`);
 
       if (delErr) {
         return res.status(500).json({ status: "ERROR", message: delErr.message });
@@ -529,7 +529,6 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
   // Risposta immediata: evita timeouts e rende l’API "prodotto-like"
   res.status(202).json({ status: "accepted", scenarioId });
 
-  // Lavoro asincrono "fire-and-forget" (stessa istanza)
   setImmediate(async () => {
     try {
       console.log("[initialize] start", { scenarioId });
@@ -546,19 +545,7 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
         return;
       }
 
-      const positionIds = [...new Set(scenApps.map((a) => a.position_id).filter(Boolean))];
-
-      // 2) Carica positions -> occupied_by (target_user_id)
-      const { data: posRows, error: posErr } = await supabaseAdmin
-        .from("positions")
-        .select("id, occupied_by")
-        .in("id", positionIds);
-
-      if (posErr) throw new Error(`positions: ${posErr.message}`);
-
-      const posToTarget = new Map((posRows ?? []).map((p) => [p.id, p.occupied_by]));
-
-      // 3) Reset: tutti inactive + delete applications
+      // 2) Reset: tutti inactive + delete applications
       const { error: upErr } = await supabaseAdmin
         .from("users")
         .update({ availability_status: "inactive" })
@@ -571,34 +558,31 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
         .neq("id", "00000000-0000-0000-0000-000000000000");
       if (delErr) throw new Error(`delete applications: ${delErr.message}`);
 
-      // 4) Crea applications reali
-      const appRows = scenApps
-        .map((a) => {
-          const target_user_id = posToTarget.get(a.position_id);
-          if (!target_user_id) return null;
-          return {
-            user_id: a.user_id,
-            target_user_id,
-            priority: a.priority,
-          };
-        })
-        .filter(Boolean);
-
-      if (appRows.length === 0) {
-        console.log("[initialize] no valid application rows (missing occupied_by?)", { scenarioId });
-        return;
-      }
+      // 3) Inserisci applications reali (schema: user_id -> position_id)
+      const appRows = scenApps.map((a) => ({
+        user_id: a.user_id,
+        position_id: a.position_id,
+        priority: a.priority,
+      }));
 
       const { error: insErr } = await supabaseAdmin.from("applications").insert(appRows);
       if (insErr) throw new Error(`insert applications: ${insErr.message}`);
 
-      // 5) Attiva utenti coinvolti (candidati + target) così appaiono in dashboard/mappa
-      const activeUserIds = [
-        ...new Set([
-          ...appRows.map((r) => r.user_id),
-          ...appRows.map((r) => r.target_user_id),
-        ]),
-      ];
+      // 4) Attiva utenti coinvolti:
+      //    - tutti i candidati (user_id)
+      //    - tutti gli occupanti delle posizioni target (positions.occupied_by)
+      const candidateUserIds = [...new Set(appRows.map((r) => r.user_id))];
+      const positionIds = [...new Set(appRows.map((r) => r.position_id).filter(Boolean))];
+
+      const { data: posRows, error: posErr } = await supabaseAdmin
+        .from("positions")
+        .select("id, occupied_by")
+        .in("id", positionIds);
+
+      if (posErr) throw new Error(`positions (for activation): ${posErr.message}`);
+
+      const targetUserIds = [...new Set((posRows ?? []).map((p) => p.occupied_by).filter(Boolean))];
+      const activeUserIds = [...new Set([...candidateUserIds, ...targetUserIds])];
 
       const { error: actErr } = await supabaseAdmin
         .from("users")
@@ -613,13 +597,17 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
         activeUsers: activeUserIds.length,
       });
 
-
       console.log("[initialize] done", { scenarioId });
     } catch (e) {
-      console.error("[initialize] failed", { scenarioId, err: e?.message, stack: e?.stack });
+      console.error("[initialize] failed", {
+        scenarioId,
+        err: e?.message,
+        stack: e?.stack,
+      });
     }
   });
 });
+
 
 
 /* ----------------------------------
@@ -700,7 +688,7 @@ app.get("/api/_debug/effects", requireAdmin, async (_req, res) => {
 
     const { data: apps, error: appErr } = await supabaseAdmin
       .from("applications")
-      .select("id, user_id, target_user_id, priority")
+      .select("id, user_id, position_id, priority")
       .limit(50);
 
     if (appErr) {
