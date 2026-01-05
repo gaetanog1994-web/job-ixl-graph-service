@@ -718,6 +718,24 @@ app.get("/api/_debug/effects", requireAdmin, async (_req, res) => {
   }
 });
 
+/* ----------------------------------
+   DEBUG: Check applications columns
+---------------------------------- */
+app.get("/api/_debug/applications-columns", requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from("applications")
+    .select("*")
+    .limit(1);
+
+  if (error) return res.status(500).json({ status: "ERROR", message: error.message });
+
+  const row = data?.[0] ?? null;
+  return res.json({
+    status: "OK",
+    columns: row ? Object.keys(row) : [],
+    sample: row,
+  });
+});
 
 /* ----------------------------------
    Graph Summary (COUNTS) (Admin only)
