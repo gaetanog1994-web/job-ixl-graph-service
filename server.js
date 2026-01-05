@@ -161,6 +161,18 @@ app.get("/api/health", async (req, res) => {
   return app._router.handle({ ...req, url: "/health", originalUrl: "/health" }, res, () => { });
 });
 
+/* ----------------------------------
+   DEBUG: Supabase backend config
+   (TEMPORARY – remove after check)
+---------------------------------- */
+app.get("/api/_debug/supabase", (_req, res) => {
+  res.json({
+    supabaseUrl: SUPABASE_URL,
+    hasServiceRole: !!SUPABASE_SERVICE_ROLE_KEY,
+  });
+});
+
+
 function requireSelfOrAdmin(paramName = "userId") {
   return async (req, res, next) => {
     try {
