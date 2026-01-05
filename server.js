@@ -195,6 +195,44 @@ function requireSelfOrAdmin(paramName = "userId") {
    - avoids writing business logic in Supabase
 ---------------------------------- */
 
+// Admin: reset all active users + clear applications (dashboard reset)
+app.post(
+  "/api/admin/reset-active-users",
+  requireAuth(),
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      // 1) set all users inactive
+      const { error: upErr } = await supabaseAdmin
+        .from("users")
+        .update({ availability_status: "inactive" })
+        .neq("availability_status", "inactive"); // aggiorna solo chi non è già inactive
+
+      if (upErr) {
+        return res.status(500).json({ status: "ERROR", message: upErr.message });
+      }
+
+      // 2) delete all applications (outgoing + incoming)
+      const { error: delErr } = await supabaseAdmin
+        .from("applications")
+        .delete()
+        .neq("id", "00000000-0000-0000-0000-000000000000"); // trucco per "delete all"
+
+      if (delErr) {
+        return res.status(500).json({ status: "ERROR", message: delErr.message });
+      }
+
+      return res.json({ status: "OK" });
+    } catch (err) {
+      return res.status(500).json({
+        status: "ERROR",
+        message: err?.message || "Unknown error",
+      });
+    }
+  }
+);
+
+
 // Deactivate a user and cleanup related applications
 app.post(
   "/api/users/:userId/deactivate",
