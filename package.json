@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "check": "node --check server.js",
+    "build": "npm run check",
     "start": "node server.js",
     "dev": "node server.js"
   },

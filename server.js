@@ -10,9 +10,39 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-console.log("🚀 Graph Service Booting...");
+function log(level, event, meta = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    service: "graph-service",
+    event,
+    ...meta,
+  };
+  const line = JSON.stringify(payload);
+  if (level === "ERROR") console.error(line);
+  else if (level === "WARN") console.warn(line);
+  else console.log(line);
+}
+
+log("INFO", "boot");
 
 const PORT = process.env.PORT || 8787;
+const APP_ENV = (process.env.APP_ENV ?? (process.env.NODE_ENV === "production" ? "production" : "development"))
+  .toLowerCase();
+const IS_PRODUCTION = APP_ENV === "production";
+const IS_DEVELOPMENT = APP_ENV === "development";
+const ENABLE_DEBUG_ENDPOINTS =
+  !IS_PRODUCTION &&
+  (
+    process.env.ENABLE_DEBUG_ENDPOINTS === "true" ||
+    (IS_DEVELOPMENT && process.env.ENABLE_DEBUG_ENDPOINTS !== "false")
+  );
+const ENABLE_HARNESS_ENDPOINTS =
+  !IS_PRODUCTION &&
+  (
+    process.env.ENABLE_HARNESS_ENDPOINTS === "true" ||
+    (IS_DEVELOPMENT && process.env.ENABLE_HARNESS_ENDPOINTS !== "false")
+  );
 
 // Neo4j
 const NEO4J_URI = process.env.NEO4J_URI;
@@ -27,12 +57,12 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!NEO4J_URI || !NEO4J_USER || !NEO4J_PASSWORD) {
-  console.error("❌ Missing Neo4j env vars");
+  log("ERROR", "missing_env_neo4j");
   process.exit(1);
 }
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Missing Supabase env vars");
+  log("ERROR", "missing_env_supabase");
   process.exit(1);
 }
 
@@ -45,15 +75,64 @@ const driver = neo4j.driver(
   neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
 );
 
+function rejectFeatureDisabled(res, code, message) {
+  return res.status(403).json({
+    status: "ERROR",
+    code,
+    message,
+  });
+}
+
+function requireDebugEnabled(res) {
+  if (ENABLE_DEBUG_ENDPOINTS) return true;
+  rejectFeatureDisabled(
+    res,
+    "DEBUG_DISABLED",
+    "Debug endpoints are disabled for this environment."
+  );
+  return false;
+}
+
+function requireHarnessEnabled(res) {
+  if (ENABLE_HARNESS_ENDPOINTS) return true;
+  rejectFeatureDisabled(
+    res,
+    "HARNESS_DISABLED",
+    "Harness endpoints are disabled. Set ENABLE_HARNESS_ENDPOINTS=true only in controlled dev/staging."
+  );
+  return false;
+}
+
 async function ensureNeo4jReady(retries = 20) {
   try {
     await driver.verifyConnectivity();
     return;
   } catch {
     if (retries <= 0) throw new Error("Neo4j not ready");
-    console.warn("⏳ Neo4j sleeping… retrying");
+    log("WARN", "neo4j_sleeping_retry", { retriesRemaining: retries });
     await new Promise((r) => setTimeout(r, 2000));
     return ensureNeo4jReady(retries - 1);
+  }
+}
+
+async function ensureNeo4jOrWaitResponse(res, operation, scope = null) {
+  try {
+    await ensureNeo4jReady(20);
+    return true;
+  } catch (e) {
+    log("WARN", "neo4j_wait", {
+      operation,
+      companyId: scope?.companyId ?? null,
+      perimeterId: scope?.perimeterId ?? null,
+      reason: e?.message ?? "Neo4j not ready",
+    });
+    res.status(503).set("Retry-After", "10").json({
+      status: "WAIT",
+      code: "NEO4J_SLEEPING",
+      message: "Neo4j is waking up, retry in a few seconds",
+      ...(scope ? { companyId: scope.companyId, perimeterId: scope.perimeterId } : {}),
+    });
+    return false;
   }
 }
 
@@ -166,6 +245,7 @@ app.get("/api/health", async (req, res) => {
    (TEMPORARY – remove after check)
 ---------------------------------- */
 app.get("/api/_debug/supabase", (_req, res) => {
+  if (!requireDebugEnabled(res)) return;
   res.json({
     supabaseUrl: SUPABASE_URL,
     hasServiceRole: !!SUPABASE_SERVICE_ROLE_KEY,
@@ -178,6 +258,7 @@ app.get("/api/_debug/supabase", (_req, res) => {
    - Returns Supabase getUser() error details
 ---------------------------------- */
 app.post("/api/_debug/auth-check", async (req, res) => {
+  if (!requireDebugEnabled(res)) return;
   try {
     const authHeader = req.header("authorization") || "";
     const m = authHeader.match(/^Bearer\s+(.+)$/i);
@@ -247,6 +328,49 @@ function requireSelfOrAdmin(paramName = "userId") {
   };
 }
 
+function asNonEmptyString(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function resolveTenantScope(req) {
+  const companyId =
+    asNonEmptyString(req.body?.companyId) ||
+    asNonEmptyString(req.query?.companyId) ||
+    asNonEmptyString(req.header("x-company-id"));
+  const perimeterId =
+    asNonEmptyString(req.body?.perimeterId) ||
+    asNonEmptyString(req.query?.perimeterId) ||
+    asNonEmptyString(req.header("x-perimeter-id"));
+
+  if (!companyId || !perimeterId) return null;
+  return { companyId, perimeterId };
+}
+
+function getTenantScopeOrRespond(req, res) {
+  const scope = resolveTenantScope(req);
+  if (!scope) {
+    res.status(400).json({
+      status: "ERROR",
+      message: "companyId and perimeterId are required",
+      code: "TENANT_SCOPE_REQUIRED",
+    });
+    return null;
+  }
+  return scope;
+}
+
+function resolveGraphNamespace(scope) {
+  return {
+    companyId: scope.companyId,
+    perimeterId: scope.perimeterId,
+    tenantKey: `${scope.companyId}::${scope.perimeterId}`,
+    // futura evoluzione: dbName dinamico per database-per-tenant
+    dbName: null,
+  };
+}
+
 /* ----------------------------------
    APP API (used by the frontend)
    - keeps Supabase as source of truth
@@ -259,6 +383,7 @@ app.post(
   requireAuth(),
   requireAdmin,
   async (_req, res) => {
+    if (!requireHarnessEnabled(res)) return;
     try {
       // 1) set all users inactive
       const { error: upErr } = await supabaseAdmin
@@ -373,44 +498,116 @@ app.post(
    Neo4j Warmup (Admin only)
 ---------------------------------- */
 app.post("/neo4j/warmup", requireAdmin, async (_req, res) => {
-  try {
-    await ensureNeo4jReady(20);
-    res.json({ status: "OK", neo4j: "ready" });
-  } catch {
-    res.json({ status: "WAIT", message: "Neo4j is waking up" });
-  }
+  const scope = getTenantScopeOrRespond(_req, res);
+  if (!scope) return;
+  const ok = await ensureNeo4jOrWaitResponse(res, "neo4j_warmup", scope);
+  if (!ok) return;
+  res.json({
+    status: "OK",
+    neo4j: "ready",
+    companyId: scope.companyId,
+    perimeterId: scope.perimeterId,
+  });
 });
 
 /* ----------------------------------
    Build Graph (Admin only)
 ---------------------------------- */
 app.post("/build-graph", requireAdmin, async (req, res) => {
-  await ensureNeo4jReady();
+  const scope = getTenantScopeOrRespond(req, res);
+  if (!scope) return;
+  const warm = await ensureNeo4jOrWaitResponse(res, "build_graph", scope);
+  if (!warm) return;
+  const namespace = resolveGraphNamespace(scope);
   const { applications, usersById } = req.body || {};
+  const scopedApps = Array.isArray(applications)
+    ? applications
+      .filter((app) => app?.user_id && app?.target_user_id)
+      .map((app) => ({
+        user_id: String(app.user_id),
+        target_user_id: String(app.target_user_id),
+        priority: app.priority ?? null,
+      }))
+    : [];
   const session = driver.session();
 
   try {
     const out = await session.writeTransaction(async (tx) => {
-      await tx.run("MATCH (n) DETACH DELETE n");
+      try {
+        await tx.run(
+          `
+          CREATE CONSTRAINT person_tenant_identity IF NOT EXISTS
+          FOR (p:Person)
+          REQUIRE (p.company_id, p.perimeter_id, p.user_id) IS UNIQUE
+          `
+        );
+      } catch (constraintErr) {
+        // compat with older Neo4j versions / limited privileges
+        console.warn("Constraint creation skipped:", constraintErr?.message || constraintErr);
+      }
+
+      await tx.run(
+        `
+        MATCH (n:Person {company_id: $companyId, perimeter_id: $perimeterId})
+        DETACH DELETE n
+        `,
+        namespace
+      );
 
       await tx.run(
         `
         UNWIND $apps AS app
-        MERGE (a:Person {id: app.user_id})
+        MERGE (a:Person {
+          company_id: $companyId,
+          perimeter_id: $perimeterId,
+          user_id: app.user_id
+        })
+        SET a.id = app.user_id,
+            a.company_id = $companyId,
+            a.perimeter_id = $perimeterId,
+            a.user_id = app.user_id,
+            a.tenant_key = $tenantKey
         SET a.full_name = coalesce($usersById[app.user_id], a.full_name)
 
-        MERGE (b:Person {id: app.target_user_id})
+        MERGE (b:Person {
+          company_id: $companyId,
+          perimeter_id: $perimeterId,
+          user_id: app.target_user_id
+        })
+        SET b.id = app.target_user_id,
+            b.company_id = $companyId,
+            b.perimeter_id = $perimeterId,
+            b.user_id = app.target_user_id,
+            b.tenant_key = $tenantKey
         SET b.full_name = coalesce($usersById[app.target_user_id], b.full_name)
 
-        MERGE (a)-[r:CANDIDATO_A]->(b)
-        SET r.priority = app.priority
+        MERGE (a)-[r:CANDIDATO_A {
+          company_id: $companyId,
+          perimeter_id: $perimeterId
+        }]->(b)
+        SET r.priority = app.priority,
+            r.company_id = $companyId,
+            r.perimeter_id = $perimeterId,
+            r.tenant_key = $tenantKey
         `,
-        { apps: applications || [], usersById: usersById || {} }
+        { ...namespace, apps: scopedApps, usersById: usersById || {} }
       );
 
-      const nodes = await tx.run("MATCH (n:Person) RETURN count(n) AS c");
+      const nodes = await tx.run(
+        `
+        MATCH (n:Person {company_id: $companyId, perimeter_id: $perimeterId})
+        RETURN count(n) AS c
+        `,
+        namespace
+      );
       const rels = await tx.run(
-        "MATCH (:Person)-[r:CANDIDATO_A]->(:Person) RETURN count(r) AS c"
+        `
+        MATCH (:Person {company_id: $companyId, perimeter_id: $perimeterId})
+              -[r:CANDIDATO_A {company_id: $companyId, perimeter_id: $perimeterId}]->
+              (:Person {company_id: $companyId, perimeter_id: $perimeterId})
+        RETURN count(r) AS c
+        `,
+        namespace
       );
 
       return {
@@ -419,9 +616,18 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
       };
     });
 
-    res.json({ status: "OK", ...out });
+    res.json({
+      status: "OK",
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      ...out,
+    });
   } catch (err) {
-    console.error("Error in /build-graph:", err);
+    log("ERROR", "build_graph_failed", {
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      message: err?.message || "Unknown error",
+    });
     res.status(500).json({ status: "ERROR", message: err.message || "Unknown error" });
   } finally {
     await session.close();
@@ -431,15 +637,23 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
 /* ----------------------------------
    Chains (Admin only)
 ---------------------------------- */
-app.post("/graph/chains", requireAdmin, async (_req, res) => {
-  await ensureNeo4jReady();
+app.post("/graph/chains", requireAdmin, async (req, res) => {
+  const scope = getTenantScopeOrRespond(req, res);
+  if (!scope) return;
+  const warm = await ensureNeo4jOrWaitResponse(res, "graph_chains", scope);
+  if (!warm) return;
+  const namespace = resolveGraphNamespace(scope);
   const session = driver.session();
 
   try {
+    const reqMaxLen = Number(req.body?.maxLen ?? 10);
+    const maxLen = Number.isFinite(reqMaxLen) ? Math.min(15, Math.max(2, reqMaxLen)) : 10;
     const cypher = `
-      MATCH path = (p:Person)-[rels:CANDIDATO_A*2..10]->(p)
+      MATCH path = (p:Person {company_id: $companyId, perimeter_id: $perimeterId})-[rels:CANDIDATO_A*2..${maxLen}]->(p)
       WITH path, nodes(path) AS ns, rels
       WHERE size(ns[0..-1]) = size(apoc.coll.toSet(ns[0..-1]))
+        AND ALL(n IN ns WHERE n.company_id = $companyId AND n.perimeter_id = $perimeterId)
+        AND ALL(r IN rels WHERE r.company_id = $companyId AND r.perimeter_id = $perimeterId)
       WITH
         ns[0..-1] AS persons,
         rels,
@@ -458,7 +672,7 @@ app.post("/graph/chains", requireAdmin, async (_req, res) => {
         avgPriority
     `;
 
-    const result = await session.run(cypher);
+    const result = await session.run(cypher, namespace);
 
     const seen = new Set();
     const chains = result.records
@@ -479,9 +693,18 @@ app.post("/graph/chains", requireAdmin, async (_req, res) => {
       })
       .map(({ key, ...rest }) => rest);
 
-    res.json({ status: "OK", chains });
+    res.json({
+      status: "OK",
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      chains,
+    });
   } catch (err) {
-    console.error("Error in /graph/chains:", err);
+    log("ERROR", "graph_chains_failed", {
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      message: err?.message || "Unknown error",
+    });
     res.status(500).json({ status: "ERROR", message: err.message || "Unknown error" });
   } finally {
     await session.close();
@@ -492,13 +715,19 @@ app.post("/graph/chains", requireAdmin, async (_req, res) => {
    Graph Summary (RELATIONS) (Admin only)
    -> serve ad AdminCandidatures (tabella Da/A/Priorità)
 ---------------------------------- */
-app.post("/graph/summary", requireAdmin, async (_req, res) => {
-  await ensureNeo4jReady(); // ✅ fondamentale
+app.post("/graph/summary", requireAdmin, async (req, res) => {
+  const scope = getTenantScopeOrRespond(req, res);
+  if (!scope) return;
+  const warm = await ensureNeo4jOrWaitResponse(res, "graph_summary", scope);
+  if (!warm) return;
+  const namespace = resolveGraphNamespace(scope);
   const session = driver.session();
 
   try {
     const cypher = `
-      MATCH (a:Person)-[r:CANDIDATO_A]->(b:Person)
+      MATCH (a:Person {company_id: $companyId, perimeter_id: $perimeterId})
+            -[r:CANDIDATO_A {company_id: $companyId, perimeter_id: $perimeterId}]->
+            (b:Person {company_id: $companyId, perimeter_id: $perimeterId})
       RETURN 
         coalesce(a.full_name, a.id) AS from_name,
         coalesce(b.full_name, b.id) AS to_name,
@@ -506,7 +735,7 @@ app.post("/graph/summary", requireAdmin, async (_req, res) => {
       ORDER BY from_name, to_name
     `;
 
-    const result = await session.run(cypher);
+    const result = await session.run(cypher, namespace);
 
     const relationships = result.records.map((rec) => ({
       from_name: rec.get("from_name"),
@@ -514,9 +743,18 @@ app.post("/graph/summary", requireAdmin, async (_req, res) => {
       priority: rec.get("priority"),
     }));
 
-    res.json({ status: "OK", relationships });
+    res.json({
+      status: "OK",
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      relationships,
+    });
   } catch (err) {
-    console.error("Error in /graph/summary:", err);
+    log("ERROR", "graph_summary_failed", {
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      message: err?.message || "Unknown error",
+    });
     res.status(500).json({ status: "ERROR", message: err.message || "Unknown error" });
   } finally {
     await session.close(); // ✅ fondamentale
@@ -524,6 +762,7 @@ app.post("/graph/summary", requireAdmin, async (_req, res) => {
 });
 
 app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) => {
+  if (!requireHarnessEnabled(res)) return;
   const scenarioId = req.params.id;
 
   // Risposta immediata: evita timeouts e rende l’API "prodotto-like"
@@ -615,6 +854,7 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
    (TEMPORARY – remove after check)
 ---------------------------------- */
 app.get("/api/_debug/scenario/:id/inspect", requireAdmin, async (req, res) => {
+  if (!requireDebugEnabled(res)) return;
   const scenarioId = req.params.id;
 
 
@@ -676,6 +916,7 @@ app.get("/api/_debug/scenario/:id/inspect", requireAdmin, async (req, res) => {
    DEBUG: Check current effects in DB
 ---------------------------------- */
 app.get("/api/_debug/effects", requireAdmin, async (_req, res) => {
+  if (!requireDebugEnabled(res)) return;
   try {
     const { data: activeUsers, error: auErr } = await supabaseAdmin
       .from("users")
@@ -710,6 +951,7 @@ app.get("/api/_debug/effects", requireAdmin, async (_req, res) => {
    DEBUG: Check applications columns
 ---------------------------------- */
 app.get("/api/_debug/applications-columns", requireAdmin, async (_req, res) => {
+  if (!requireDebugEnabled(res)) return;
   const { data, error } = await supabaseAdmin
     .from("applications")
     .select("*")
@@ -728,23 +970,45 @@ app.get("/api/_debug/applications-columns", requireAdmin, async (_req, res) => {
 /* ----------------------------------
    Graph Summary (COUNTS) (Admin only)
 ---------------------------------- */
-app.get("/graph/summary", requireAdmin, async (_req, res) => {
-  await ensureNeo4jReady(); // ✅ fondamentale
+app.get("/graph/summary", requireAdmin, async (req, res) => {
+  const scope = getTenantScopeOrRespond(req, res);
+  if (!scope) return;
+  const warm = await ensureNeo4jOrWaitResponse(res, "graph_summary_counts", scope);
+  if (!warm) return;
+  const namespace = resolveGraphNamespace(scope);
   const session = driver.session();
 
   try {
-    const nodes = await session.run("MATCH (n:Person) RETURN count(n) AS c");
+    const nodes = await session.run(
+      `
+      MATCH (n:Person {company_id: $companyId, perimeter_id: $perimeterId})
+      RETURN count(n) AS c
+      `,
+      namespace
+    );
     const rels = await session.run(
-      "MATCH (:Person)-[r:CANDIDATO_A]->(:Person) RETURN count(r) AS c"
+      `
+      MATCH (:Person {company_id: $companyId, perimeter_id: $perimeterId})
+            -[r:CANDIDATO_A {company_id: $companyId, perimeter_id: $perimeterId}]->
+            (:Person {company_id: $companyId, perimeter_id: $perimeterId})
+      RETURN count(r) AS c
+      `,
+      namespace
     );
 
     res.json({
       status: "OK",
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
       nodes: nodes.records[0].get("c").toNumber(),
       relationships: rels.records[0].get("c").toNumber(),
     });
   } catch (err) {
-    console.error("Error in GET /graph/summary:", err);
+    log("ERROR", "graph_summary_counts_failed", {
+      companyId: scope.companyId,
+      perimeterId: scope.perimeterId,
+      message: err?.message || "Unknown error",
+    });
     res.status(500).json({ status: "ERROR", message: err.message || "Unknown error" });
   } finally {
     await session.close(); // ✅ fondamentale
@@ -752,6 +1016,7 @@ app.get("/graph/summary", requireAdmin, async (_req, res) => {
 });
 
 app.get("/api/_debug/routes", (_req, res) => {
+  if (!requireDebugEnabled(res)) return;
   const routes = [];
   app._router.stack.forEach((layer) => {
     if (layer.route && layer.route.path) {
@@ -769,5 +1034,5 @@ app.get("/api/_debug/routes", (_req, res) => {
    START SERVER
 ---------------------------------- */
 app.listen(Number(PORT), () => {
-  console.log(`🚀 Graph Service listening on port ${PORT}`);
+  log("INFO", "listen", { port: Number(PORT) });
 });
