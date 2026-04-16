@@ -337,11 +337,15 @@ function asNonEmptyString(value) {
 function resolveTenantScope(req) {
   const companyId =
     asNonEmptyString(req.body?.companyId) ||
+    asNonEmptyString(req.body?.company_id) ||
     asNonEmptyString(req.query?.companyId) ||
+    asNonEmptyString(req.query?.company_id) ||
     asNonEmptyString(req.header("x-company-id"));
   const perimeterId =
     asNonEmptyString(req.body?.perimeterId) ||
+    asNonEmptyString(req.body?.perimeter_id) ||
     asNonEmptyString(req.query?.perimeterId) ||
+    asNonEmptyString(req.query?.perimeter_id) ||
     asNonEmptyString(req.header("x-perimeter-id"));
 
   if (!companyId || !perimeterId) return null;
@@ -353,7 +357,7 @@ function getTenantScopeOrRespond(req, res) {
   if (!scope) {
     res.status(400).json({
       status: "ERROR",
-      message: "companyId and perimeterId are required",
+      message: "companyId/perimeterId (or company_id/perimeter_id) are required",
       code: "TENANT_SCOPE_REQUIRED",
     });
     return null;
