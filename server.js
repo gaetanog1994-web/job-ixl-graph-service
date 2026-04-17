@@ -527,6 +527,14 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
   const scopedApps = Array.isArray(applications)
     ? applications
       .filter((app) => app?.user_id && app?.target_user_id)
+      .filter((app) => {
+        const appCompanyId = app?.company_id ?? app?.companyId ?? null;
+        const appPerimeterId = app?.perimeter_id ?? app?.perimeterId ?? null;
+        // Defense-in-depth: discard cross-tenant payload rows if a caller sends mixed data.
+        if (appCompanyId && String(appCompanyId) !== namespace.companyId) return false;
+        if (appPerimeterId && String(appPerimeterId) !== namespace.perimeterId) return false;
+        return true;
+      })
       .map((app) => ({
         user_id: String(app.user_id),
         target_user_id: String(app.target_user_id),
@@ -653,7 +661,9 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
     const reqMaxLen = Number(req.body?.maxLen ?? 10);
     const maxLen = Number.isFinite(reqMaxLen) ? Math.min(15, Math.max(2, reqMaxLen)) : 10;
     const cypher = `
-      MATCH path = (p:Person {company_id: $companyId, perimeter_id: $perimeterId})-[rels:CANDIDATO_A*2..${maxLen}]->(p)
+      MATCH path = (n:Person)-[rels:CANDIDATO_A*2..${maxLen}]->(n)
+      WHERE n.company_id = $companyId
+        AND n.perimeter_id = $perimeterId
       WITH path, nodes(path) AS ns, rels
       WHERE size(ns[0..-1]) = size(apoc.coll.toSet(ns[0..-1]))
         AND ALL(n IN ns WHERE n.company_id = $companyId AND n.perimeter_id = $perimeterId)
@@ -671,7 +681,8 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
           ) / 100
         END AS avgPriority
       RETURN
-        [p IN persons | coalesce(p.full_name, p.id)] AS people,
+        [p IN persons | p.user_id] AS users,
+        [p IN persons | coalesce(p.full_name, p.id)] AS peopleNames,
         size(persons) AS length,
         avgPriority
     `;
@@ -681,11 +692,13 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
     const seen = new Set();
     const chains = result.records
       .map((rec) => {
-        const people = rec.get("people");
-        const key = people.slice().sort().join("|");
+        const users = rec.get("users");
+        const peopleNames = rec.get("peopleNames");
+        const key = users.slice().sort().join("|");
         return {
           key,
-          people,
+          users,
+          peopleNames,
           length: rec.get("length").toNumber(),
           avgPriority: rec.get("avgPriority"),
         };
@@ -729,9 +742,13 @@ app.post("/graph/summary", requireAdmin, async (req, res) => {
 
   try {
     const cypher = `
-      MATCH (a:Person {company_id: $companyId, perimeter_id: $perimeterId})
-            -[r:CANDIDATO_A {company_id: $companyId, perimeter_id: $perimeterId}]->
-            (b:Person {company_id: $companyId, perimeter_id: $perimeterId})
+      MATCH (a:Person)-[r:CANDIDATO_A]->(b:Person)
+      WHERE a.company_id = $companyId
+        AND a.perimeter_id = $perimeterId
+        AND b.company_id = $companyId
+        AND b.perimeter_id = $perimeterId
+        AND r.company_id = $companyId
+        AND r.perimeter_id = $perimeterId
       RETURN 
         coalesce(a.full_name, a.id) AS from_name,
         coalesce(b.full_name, b.id) AS to_name,
