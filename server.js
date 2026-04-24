@@ -375,6 +375,16 @@ function resolveGraphNamespace(scope) {
   };
 }
 
+function resolveCampaignId(req) {
+  return (
+    asNonEmptyString(req.body?.campaignId) ||
+    asNonEmptyString(req.body?.campaign_id) ||
+    asNonEmptyString(req.query?.campaignId) ||
+    asNonEmptyString(req.query?.campaign_id) ||
+    asNonEmptyString(req.header("x-campaign-id"))
+  );
+}
+
 /* ----------------------------------
    APP API (used by the frontend)
    - keeps Supabase as source of truth
@@ -523,6 +533,14 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
   const warm = await ensureNeo4jOrWaitResponse(res, "build_graph", scope);
   if (!warm) return;
   const namespace = resolveGraphNamespace(scope);
+  const campaignId = resolveCampaignId(req);
+  if (!campaignId) {
+    return res.status(400).json({
+      status: "ERROR",
+      code: "CAMPAIGN_ID_REQUIRED",
+      message: "campaignId/campaign_id is required",
+    });
+  }
   const { applications, usersById } = req.body || {};
   const scopedApps = Array.isArray(applications)
     ? applications
@@ -539,7 +557,9 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
         user_id: String(app.user_id),
         target_user_id: String(app.target_user_id),
         priority: app.priority ?? null,
+        campaign_id: String(app.campaign_id ?? app.campaignId ?? campaignId),
       }))
+      .filter((app) => app.campaign_id === campaignId)
     : [];
   const session = driver.session();
 
@@ -595,14 +615,16 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
 
         MERGE (a)-[r:CANDIDATO_A {
           company_id: $companyId,
-          perimeter_id: $perimeterId
+          perimeter_id: $perimeterId,
+          campaign_id: app.campaign_id
         }]->(b)
         SET r.priority = app.priority,
             r.company_id = $companyId,
             r.perimeter_id = $perimeterId,
+            r.campaign_id = app.campaign_id,
             r.tenant_key = $tenantKey
         `,
-        { ...namespace, apps: scopedApps, usersById: usersById || {} }
+        { ...namespace, campaignId, apps: scopedApps, usersById: usersById || {} }
       );
 
       const nodes = await tx.run(
@@ -624,7 +646,7 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
 
       return {
         nodes: nodes.records[0].get("c").toNumber(),
-        relationships: rels.records[0].get("c").toNumber(),
+      relationships: rels.records[0].get("c").toNumber(),
       };
     });
 
@@ -632,6 +654,7 @@ app.post("/build-graph", requireAdmin, async (req, res) => {
       status: "OK",
       companyId: scope.companyId,
       perimeterId: scope.perimeterId,
+      campaignId,
       ...out,
     });
   } catch (err) {
@@ -655,6 +678,14 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
   const warm = await ensureNeo4jOrWaitResponse(res, "graph_chains", scope);
   if (!warm) return;
   const namespace = resolveGraphNamespace(scope);
+  const campaignId = resolveCampaignId(req);
+  if (!campaignId) {
+    return res.status(400).json({
+      status: "ERROR",
+      code: "CAMPAIGN_ID_REQUIRED",
+      message: "campaignId/campaign_id is required",
+    });
+  }
   const session = driver.session();
 
   try {
@@ -667,7 +698,7 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
       WITH path, nodes(path) AS ns, rels
       WHERE size(ns[0..-1]) = size(apoc.coll.toSet(ns[0..-1]))
         AND ALL(n IN ns WHERE n.company_id = $companyId AND n.perimeter_id = $perimeterId)
-        AND ALL(r IN rels WHERE r.company_id = $companyId AND r.perimeter_id = $perimeterId)
+        AND ALL(r IN rels WHERE r.company_id = $companyId AND r.perimeter_id = $perimeterId AND r.campaign_id = $campaignId)
       WITH
         ns[0..-1] AS persons,
         rels,
@@ -687,7 +718,7 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
         avgPriority
     `;
 
-    const result = await session.run(cypher, namespace);
+    const result = await session.run(cypher, { ...namespace, campaignId });
 
     const seen = new Set();
     const chains = result.records
@@ -714,6 +745,7 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
       status: "OK",
       companyId: scope.companyId,
       perimeterId: scope.perimeterId,
+      campaignId,
       chains,
     });
   } catch (err) {
@@ -796,7 +828,7 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
       // 1) Carica le candidature scenario (isolated)
       const { data: scenApps, error: scenErr } = await supabaseAdmin
         .from("test_scenario_applications")
-        .select("user_id, position_id, priority")
+        .select("user_id, position_id, priority, company_id, perimeter_id")
         .eq("scenario_id", scenarioId);
 
       if (scenErr) throw new Error(`test_scenario_applications: ${scenErr.message}`);
@@ -804,6 +836,24 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
         console.log("[initialize] no scenario applications found", { scenarioId });
         return;
       }
+
+      const scopeCompanyId = scenApps[0]?.company_id ?? null;
+      const scopePerimeterId = scenApps[0]?.perimeter_id ?? null;
+      if (!scopeCompanyId || !scopePerimeterId) {
+        throw new Error("test scenario rows missing company/perimeter scope");
+      }
+
+      const { data: activeCampaign, error: activeCampaignErr } = await supabaseAdmin
+        .from("campaigns")
+        .select("id")
+        .eq("company_id", scopeCompanyId)
+        .eq("perimeter_id", scopePerimeterId)
+        .neq("status", "campaign_closed")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (activeCampaignErr) throw new Error(`campaigns lookup: ${activeCampaignErr.message}`);
+      if (!activeCampaign?.id) throw new Error("no active campaign for scenario initialize");
 
       // 2) Reset: tutti inactive + delete applications
       const { error: upErr } = await supabaseAdmin
@@ -823,6 +873,9 @@ app.post("/api/test-scenarios/:id/initialize", requireAdmin, async (req, res) =>
         user_id: a.user_id,
         position_id: a.position_id,
         priority: a.priority,
+        company_id: a.company_id,
+        perimeter_id: a.perimeter_id,
+        campaign_id: activeCampaign.id,
       }));
 
       const { error: insErr } = await supabaseAdmin.from("applications").insert(appRows);
