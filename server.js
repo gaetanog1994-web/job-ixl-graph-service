@@ -712,7 +712,7 @@ app.post("/graph/chains", requireAdmin, async (req, res) => {
           ) / 100
         END AS avgPriority
       RETURN
-        [p IN persons | p.user_id] AS users,
+        [p IN persons | coalesce(p.user_id, p.id)] AS users,
         [p IN persons | coalesce(p.full_name, p.id)] AS peopleNames,
         size(persons) AS length,
         avgPriority
